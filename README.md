@@ -21,27 +21,19 @@ make
 
 ---
 
-## Architecture 
-This section documents the specific engineering decisions I made to keep the engine fast and deterministic.
+## Architecture
 
-### 1. Memory Alignment & The `Order` Struct
-The `Order` struct fits perfectly inside a single CPU Cache Line to prevent unaligned memory reads.
-* **No Floats:** Floating-point math causes rounding errors and is slower for the CPU's ALU. I multiply all prices by 10,000 and store them as `uint64_t` ticks.
-* **Diet Enums:** Standard enums take 4 bytes. I scoped my `Side` and `Type` enums to `uint8_t` to shrink them to 1 byte.
-* **The 32-Byte Perfect Fit:** By ordering my variables carefully (`8 + 8 + 8 + 4 + 1 + 1 = 30`), the C++ compiler adds 2 bytes of invisible padding, aligning every single order exactly to a 32-byte boundary. Two complete orders fit flawlessly into my M2's 64-byte L1 cache line.
+### 1. Order Storage
+Each order is stored in a compact struct. Prices are handled as integer ticks instead of floats to avoid precision issues. The Side and Type fields use small enum types to keep the structure lightweight.
 
-### 2. Enforcing Price-Time Priority
- 
-* **Price (The Red-Black Tree):** Used `std::map` to hold the prices. Finding the absolute best buyer or seller is always an $O(1)$ or $O(\log N)$ operation. 
-* **Time (The Doubly Linked List):** The value inside the map is a `std::list<Order>`. New orders are pushed to the `.back()`, and the engine always executes against the `.front()`.
+### 2. Price-Time Priority
+Orders are grouped by price using std::map. For each price level, orders are kept in a std::list, so the oldest order at that price is matched first. This follows price-time priority.
 
-### 3. The Matching Loop & Memory Cleanup 
-* **Crucial Detail:** I explicitly wrote logic to `.pop_front()` empty orders and `.erase()` empty price nodes from the map. 
+### 3. Matching
+When a new order comes in, the engine checks the best available opposite side price levels and matches orders one by one. After matching, empty orders and empty price levels are removed.
 
-### 4. $O(1)$ Order Cancellations
-
-* **The Solution:** I implemented an "Active Order Tracker" using a `std::unordered_map`. When an order is placed, I use `std::prev(list.end())` to grab its exact memory location (its iterator) and store it in the hash map. 
-
+### 4. Fast Cancellation
+To support cancellations, the book keeps a hash map of active order IDs and their positions in the order lists. This makes it quick to locate and remove an order.
 
 ---
 
