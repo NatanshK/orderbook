@@ -10,6 +10,18 @@
 #include <numeric>
 #include "Order.hpp"
 
+struct Level
+{
+    uint64_t price;
+    uint32_t total_quantity;
+};
+
+struct OrderBookSnapshot
+{
+    std::vector<Level> bids;
+    std::vector<Level> asks;
+};
+
 class OrderBook
 {
 private:
@@ -39,6 +51,7 @@ public:
     void modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_quantity);
     void processQueue();
     void printLatencyStats();
+    OrderBookSnapshot getSnapshot(int depth = 5);
 
 private:
     void matchBuyOrder(Order &order);

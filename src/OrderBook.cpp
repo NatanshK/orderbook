@@ -315,3 +315,43 @@ void OrderBook::printLatencyStats()
     std::cout << "99th Pctl      : " << p99 << " ns\n";
     std::cout << "----------------------\n";
 }
+
+OrderBookSnapshot OrderBook::getSnapshot(int depth)
+{
+    OrderBookSnapshot snapshot;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(bids_mutex_);
+        int count = 0;
+        for (auto const &[price, orders] : bids_)
+        {
+            if (count >= depth)
+                break;
+            uint32_t level_volume = 0;
+            for (auto const &order : orders)
+            {
+                level_volume += order.quantity;
+            }
+            snapshot.bids.push_back({price, level_volume});
+            count++;
+        }
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(asks_mutex_);
+        int count = 0;
+        for (auto const &[price, orders] : asks_)
+        {
+            if (count >= depth)
+                break;
+            uint32_t level_volume = 0;
+            for (auto const &order : orders)
+            {
+                level_volume += order.quantity;
+            }
+            snapshot.asks.push_back({price, level_volume});
+            count++;
+        }
+    }
+    return snapshot;
+}
