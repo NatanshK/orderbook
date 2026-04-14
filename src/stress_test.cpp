@@ -29,7 +29,10 @@ int main()
     // We batch orders into 8KB chunks to maximize TCP throughput
     for (int i = 1; i <= NUM_ORDERS; ++i)
     {
-        payload += "ADD " + std::to_string(i) + " BUY 100 10\n";
+        if (i % 2 == 1)
+            payload += "ADD " + std::to_string(i) + " BUY 100 10\n";
+        else
+            payload += "ADD " + std::to_string(i) + " SELL 100 10\n";
 
         if (payload.size() > 8000)
         {

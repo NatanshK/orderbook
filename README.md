@@ -1,84 +1,164 @@
-# High-Frequency Limit Order Book (C++17)
+# Limit Order Book Matching Engine (C++17)
 
-A highly optimized, low-latency Limit Order Book (LOB) matching engine built entirely in C++17.
+A low-latency order book matching engine built from scratch in C++17 with a TCP network gateway. Supports LIMIT, MARKET, and IOC order types, cancel/modify operations, and real-time market data snapshots over a binary protocol.
 
-I built this project to explore systems programming, concurrency, and operating system-level networking. It implements strict price-time priority matching and supports partial fills, cancellations, and real-time order ingestion over a raw TCP socket.
 
-## Performance Benchmarks
+## What it does
 
-*Tested on an Apple Silicon M2 processor.*
+- Matches incoming buy and sell orders using strict **price-time priority** (FIFO within each price level)
+- Supports **LIMIT**, **MARKET**, and **IOC** (Immediate-or-Cancel) order types
+- Handles partial fills, multi-level sweeps, order cancellation, and order modification with correct queue priority semantics
+- Ingests orders over raw **TCP sockets** using macOS `kqueue` for non-blocking I/O multiplexing
+- Serves real-time **market data snapshots** (top-of-book depth) as a packed binary protocol
+- Logs every trade with buyer/seller IDs, price, quantity, and nanosecond timestamps
+- Includes a **21-test deterministic correctness suite** and a **TCP stress test** that fires 100K orders
 
-* **Internal Core Throughput:** 12.5 million operations/second (80 nanoseconds/order)
-* **Network TCP Throughput:** 1.9 million messages/second (batched)
-* **99th Percentile Latency:** 31.5 microseconds total round-trip, including network parsing and memory allocation
+## Performance
 
-## Build Instructions
+Tested on Apple M2, compiled with `-O3 -mcpu=apple-m2`.
 
-### macOS / Apple Silicon
+Stress test: 100,000 orders over TCP, alternating buys and sells at the same price so every order triggers a match.
 
-This project is compiled natively for ARM64.
+|Metric |Value |
+|---------------|---------|
+|Average latency|~1,000 ns|
+|Min latency |83 ns |
+|99th percentile|~24 µs |
+|Max latency |~106 µs |
+
+
+
+## Architecture
+
+### Core data structures
+
+The book uses `std::map<price, std::list<Order>>` — a red-black tree keyed by price, with a doubly linked list of orders at each level. This gives:
+
+- **O(log n)** to find best bid/ask (tree traversal)
+- **O(1)** to match the front order at a level (list pop)
+- **O(1)** to cancel any order anywhere in the book
+
+That last one works because of a `tbb::concurrent_hash_map<order_id, list::iterator>` that stores a direct iterator to every resting order. When a cancel comes in, we look up the iterator, jump straight to the node, and erase it — no tree traversal needed.
+
+### Concurrency model 
+
+The network layer and the matching engine run on separate threads. The TCP server parses incoming commands and pushes `Order` structs (tagged with an `Action:` ADD, CANCEL, or MODIFY) into a `tbb::concurrent_queue`. A single dedicated worker thread pops from the queue and is the **only thread that ever mutates the order book**.
+
+This eliminates lock contention on the hot matching path. The only mutexes in the system are `std::shared_mutex` on each side of the book (bids/asks), and they exist solely to let `getSnapshot()` read consistently from the network thread while the worker is writing.
+
+
+### Order modification rules
+
+These follow real exchange semantics:
+
+- **Quantity decrease** → in-place update; the order keeps its original timestamp and queue position
+- **Quantity increase** → cancel + re-add at the back of the queue (you’re asking for more, so you lose priority)
+- **Price change** → cancel + re-add (fundamentally a new order)
+- **Quantity to zero** → treated as a cancel
+
+### Order types
+
+- **LIMIT**: Match if the price crosses, otherwise rest in the book
+- **MARKET**: Match at any available price. Never rests — if there’s nothing to match against, the remainder is discarded
+- **IOC**: Match what you can immediately, discard the rest. Same as MARKET but respects the price limit
+
+### Network layer
+
+The TCP server uses macOS `kqueue` for event-driven I/O multiplexing — one thread handles many clients without spawning a thread per connection. Incoming bytes are buffered per client and split on newline boundaries, with safe handling of fragmented TCP packets and malformed input.
+
+The text protocol looks like:
+
+```
+ADD <order_id> <BUY|SELL> <price> <quantity> [MARKET|IOC]
+CAN <order_id>
+MOD <order_id> <new_price> <new_quantity>
+VIEW
+SHUTDOWN
+```
+
+`VIEW` returns a packed binary snapshot (not text) — a 9-byte header followed by 12-byte level entries. The Python client (`client.py`) demonstrates how to decode it.
+
+## Project structure
+
+```
+include/
+Order.hpp — Order, Trade, Side, Type, Action structs
+OrderBook.hpp — OrderBook class with queue-based concurrency
+TCPServer.hpp — kqueue-based TCP server
+
+src/
+OrderBook.cpp — Matching engine, cancel/modify, snapshots, latency stats
+TCPServer.cpp — Network parsing, binary snapshot serialization
+main.cpp — Wires up OrderBook + TCPServer on port 8080
+correctness_test.cpp — 21 deterministic tests (no worker thread, manual queue flush)
+stress_test.cpp — TCP client that blasts 100K orders and measures round-trip time
+
+client.py — Python client that decodes binary VIEW snapshots
+```
+
+## Build and run
 
 ### Prerequisites
 
-* CMake 3.15+
-* Intel TBB (`brew install tbb`)
-* Apple Clang
+- macOS (uses `kqueue` for I/O multiplexing)
+- CMake 3.15+
+- Intel TBB (`brew install tbb`)
+- Apple Clang (ships with Xcode Command Line Tools)
 
 ### Build
 
-Homebrew installs libraries under `/opt/homebrew` on Apple Silicon, so CMake is configured to use those paths.
-
 ```bash
-mkdir build
-cd build
+mkdir build && cd build
 cmake ..
 make
-./orderbook
 ```
 
-## Architecture and Design Overview
-
-### 1. Network Multiplexing with `kqueue`
-
-Instead of creating a thread per client, the server uses macOS `kqueue` to handle multiple TCP connections through a single event loop. This keeps the networking layer efficient, scalable, and non-blocking.
-
-### 2. Lock-Free Handoff with a Single-Writer Model
-
-Standard `std::mutex` locks cause OS context switches, which are expensive at microsecond latency. To avoid lock contention, the engine separates networking from book mutation:
-
-* Network threads parse incoming orders and push them into an Intel TBB `concurrent_queue`
-* A single dedicated background thread pops from the queue and mutates the order book
-
-Because only one thread ever touches the Red-Black tree, the core matching path requires no locks.
-
-### 3. Price-Time Priority Storage
-
-Orders are grouped by price using a `std::map`, which keeps the spread sorted and provides `O(log n)` price lookup. Inside each price level, orders are stored in a `std::list`, ensuring matching against the oldest order at that price is an `O(1)` operation.
-
-### 4. Fast Cancellations
-
-The engine maintains a `tbb::concurrent_hash_map` of active Order IDs, storing direct iterators to each order’s exact position in the nested lists. This allows canceled orders to be removed from the book in `O(1)` time without traversing the Red-Black tree.
-
-### 5. Defensive Parsing
-
-High-throughput network testing revealed the "Poison Pill" packet issue, where malformed strings or fragmented buffers could crash the parser. The TCP handler now buffers raw bytes, safely splits messages on newline boundaries, and wraps integer parsing in a `try/catch` block. Malformed network strings are dropped safely instead of crashing the main thread.
-
-## Testing
-
-A custom TCP stress test client is included to overwhelm the OS network stack and measure the engine’s real latency.
-
-### Run
-
-Terminal 1:
+### Run the server
 
 ```bash
 ./orderbook
 ```
 
-Terminal 2:
+### Run the correctness tests
+
+```bash
+./correctness_test
+```
+
+### Run the stress test
+
+With the server running in another terminal:
 
 ```bash
 ./stress_test
 ```
 
-The client batches 100,000 orders over localhost to maximize TCP throughput, waits for a shutdown acknowledgment, and then the engine prints its internal latency percentiles.
+The server prints a latency report (avg, min, max, p99) on shutdown.
+
+### View the order book from Python
+
+With the server running:
+
+```bash
+python3 client.py
+```
+
+## Tests
+
+The correctness suite has 21 tests covering:
+
+- Resting orders that shouldn’t match (spread too wide)
+- Exact full fills and partial fills
+- FIFO price-time priority within a level
+- Multi-level sweeps (one aggressive order eating through several price levels)
+- Cancel: basic, non-existent order, already-filled order
+- Modify: quantity decrease (keeps priority), quantity increase (loses priority), price change (relocates), quantity-to-zero (treated as cancel), non-existent order
+- Aggregation of multiple orders at the same price level
+- Snapshot depth limiting
+- Partial match + rest (order crosses, fills partially, remainder rests on the other side)
+- MARKET orders filling at any price and not resting
+- IOC orders discarding unfilled remainder
+- Trade log recording correct buyer/seller IDs, price, and quantity
+
+All tests run synchronously using `OrderBook(false)` which disables the background worker thread, allowing the test to call `processQueue()` manually. This makes the tests fully deterministic with no timing dependencies.
+

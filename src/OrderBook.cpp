@@ -34,14 +34,26 @@ void OrderBook::processQueue()
 
     while (order_queue_.try_pop(current_order))
     {
+        switch (current_order.action)
+        {
+        case Action::ADD:
+            if (current_order.side == Side::BUY)
+            {
+                matchBuyOrder(current_order);
+            }
+            else
+            {
+                matchSellOrder(current_order);
+            }
+            break;
 
-        if (current_order.side == Side::BUY)
-        {
-            matchBuyOrder(current_order);
-        }
-        else
-        {
-            matchSellOrder(current_order);
+        case Action::CANCEL:
+            cancelOrder(current_order.order_id);
+            break;
+
+        case Action::MODIFY:
+            modifyOrder(current_order.order_id, current_order.price, current_order.quantity);
+            break;
         }
     }
 }
@@ -61,11 +73,12 @@ void OrderBook::matchBuyOrder(Order &order)
 {
     {
         std::unique_lock<std::shared_mutex> asks_lock(asks_mutex_);
-        // 1. Are there sellers?
-        // 2. Is the cheapest seller asking for a price <= our buyer's limit price?
-        // 3. Does our buyer still need shares?
-        while (!asks_.empty() && asks_.begin()->first <= order.price && order.quantity > 0)
+
+        while (!asks_.empty() && order.quantity > 0)
         {
+            // LIMIT orders only match if ask price <= bid price
+            if (order.type == Type::LIMIT && asks_.begin()->first > order.price)
+                break;
 
             auto &best_price_list = asks_.begin()->second;
             Order &best_ask = best_price_list.front();
@@ -73,15 +86,19 @@ void OrderBook::matchBuyOrder(Order &order)
             uint32_t trade_qty = std::min(order.quantity, best_ask.quantity);
 
             auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-            auto latency = end_time - order.timestamp;
+            execution_latencies_.push_back(end_time - order.timestamp);
 
-            execution_latencies_.push_back(latency);
+            Trade t;
+            t.buy_order_id = order.order_id;
+            t.sell_order_id = best_ask.order_id;
+            t.price = best_ask.price;
+            t.quantity = trade_qty;
+            t.timestamp = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+            trade_log_.push_back(t);
 
-            // Deduct the quantities
             order.quantity -= trade_qty;
             best_ask.quantity -= trade_qty;
 
-            // Cleanup empty orders and empty price levels
             if (best_ask.quantity == 0)
             {
                 active_orders_.erase(best_ask.order_id);
@@ -93,21 +110,15 @@ void OrderBook::matchBuyOrder(Order &order)
             }
         }
     }
-
-    // If the buyer still needs shares, put the remainder in the Bid book
-    if (order.quantity > 0)
+    if (order.quantity > 0 && order.type == Type::LIMIT)
     {
         std::unique_lock<std::shared_mutex> bids_lock(bids_mutex_);
         bids_[order.price].push_back(order);
-
         auto new_order_iterator = std::prev(bids_[order.price].end());
-
         active_orders_.insert({order.order_id, new_order_iterator});
 
         auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        auto latency = end_time - order.timestamp;
-
-        execution_latencies_.push_back(latency);
+        execution_latencies_.push_back(end_time - order.timestamp);
     }
 }
 
@@ -115,11 +126,11 @@ void OrderBook::matchSellOrder(Order &order)
 {
     {
         std::unique_lock<std::shared_mutex> bids_lock(bids_mutex_);
-        // 1. Are there buyers?
-        // 2. Is the highest buyer offering a price >= our seller's limit price?
-        // 3. Does our seller still need to offload shares?
-        while (!bids_.empty() && bids_.begin()->first >= order.price && order.quantity > 0)
+
+        while (!bids_.empty() && order.quantity > 0)
         {
+            if (order.type == Type::LIMIT && bids_.begin()->first < order.price)
+                break;
 
             auto &best_price_list = bids_.begin()->second;
             Order &best_bid = best_price_list.front();
@@ -127,14 +138,19 @@ void OrderBook::matchSellOrder(Order &order)
             uint32_t trade_qty = std::min(order.quantity, best_bid.quantity);
 
             auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-            auto latency = end_time - order.timestamp;
+            execution_latencies_.push_back(end_time - order.timestamp);
 
-            execution_latencies_.push_back(latency);
+            Trade t;
+            t.buy_order_id = best_bid.order_id;
+            t.sell_order_id = order.order_id;
+            t.price = best_bid.price;
+            t.quantity = trade_qty;
+            t.timestamp = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+            trade_log_.push_back(t);
 
             order.quantity -= trade_qty;
             best_bid.quantity -= trade_qty;
 
-            // Cleanup empty orders and empty price levels
             if (best_bid.quantity == 0)
             {
                 active_orders_.erase(best_bid.order_id);
@@ -147,20 +163,15 @@ void OrderBook::matchSellOrder(Order &order)
         }
     }
 
-    // If the seller still has shares to offload, put the remainder in the Ask book
-    if (order.quantity > 0)
+    if (order.quantity > 0 && order.type == Type::LIMIT)
     {
         std::unique_lock<std::shared_mutex> asks_lock(asks_mutex_);
         asks_[order.price].push_back(order);
-
         auto new_order_iterator = std::prev(asks_[order.price].end());
-
         active_orders_.insert({order.order_id, new_order_iterator});
 
         auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        auto latency = end_time - order.timestamp;
-
-        execution_latencies_.push_back(latency);
+        execution_latencies_.push_back(end_time - order.timestamp);
     }
 }
 
@@ -289,6 +300,24 @@ void OrderBook::modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_
     }
 }
 
+void OrderBook::submitCancel(uint64_t order_id)
+{
+    Order o{};
+    o.order_id = order_id;
+    o.action = Action::CANCEL;
+    order_queue_.push(o);
+}
+
+void OrderBook::submitModify(uint64_t order_id, uint64_t new_price, uint32_t new_quantity)
+{
+    Order o{};
+    o.order_id = order_id;
+    o.price = new_price;
+    o.quantity = new_quantity;
+    o.action = Action::MODIFY;
+    order_queue_.push(o);
+}
+
 void OrderBook::printLatencyStats()
 {
     if (execution_latencies_.empty())
@@ -354,4 +383,10 @@ OrderBookSnapshot OrderBook::getSnapshot(int depth)
         }
     }
     return snapshot;
+}
+
+OrderBook::OrderBook(bool start_worker) : is_running_(start_worker)
+{
+    if (start_worker)
+        worker_thread_ = std::thread(&OrderBook::workerLoop, this);
 }

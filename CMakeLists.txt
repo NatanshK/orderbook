@@ -19,3 +19,7 @@ target_link_libraries(orderbook PRIVATE TBB::tbb Threads::Threads)
 
 # 2. The TCP Network Stress Test Client
 add_executable(stress_test src/stress_test.cpp)
+
+#3. The Correctness Test 
+add_executable(correctness_test src/correctness_test.cpp src/OrderBook.cpp)
+target_link_libraries(correctness_test PRIVATE TBB::tbb Threads::Threads)

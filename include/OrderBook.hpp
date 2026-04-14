@@ -46,15 +46,21 @@ public:
     OrderBook();
     ~OrderBook();
 
+    explicit OrderBook(bool start_worker);
+
     void addOrder(Order order);
-    void cancelOrder(uint64_t order_id);
-    void modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_quantity);
+    void submitCancel(uint64_t order_id);
+    void submitModify(uint64_t order_id, uint64_t new_price, uint32_t new_quantity);
     void processQueue();
+    const tbb::concurrent_vector<Trade> &getTradeLog() const { return trade_log_; }
     void printLatencyStats();
     OrderBookSnapshot getSnapshot(int depth = 5);
 
 private:
     void matchBuyOrder(Order &order);
     void matchSellOrder(Order &order);
+    void cancelOrder(uint64_t order_id);
+    void modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_quantity);
     tbb::concurrent_vector<uint64_t> execution_latencies_;
+    tbb::concurrent_vector<Trade> trade_log_;
 };

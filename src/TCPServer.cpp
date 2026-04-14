@@ -186,20 +186,29 @@ void TCPServer::parseAndRouteCommand(int client_fd, const std::string &command)
 
     try
     {
-        if (tokens[0] == "ADD" && tokens.size() == 5)
+        if (tokens[0] == "ADD" && tokens.size() >= 5)
         {
-            Order o;
+            Order o{};
             o.order_id = std::stoull(tokens[1]);
             o.side = (tokens[2] == "BUY") ? Side::BUY : Side::SELL;
             o.price = std::stoull(tokens[3]);
             o.quantity = std::stoul(tokens[4]);
+            o.type = Type::LIMIT; // default
+
+            if (tokens.size() == 6)
+            {
+                if (tokens[5] == "MARKET")
+                    o.type = Type::MARKET;
+                else if (tokens[5] == "IOC")
+                    o.type = Type::IOC;
+            }
 
             engine_.addOrder(o);
         }
         else if (tokens[0] == "CAN" && tokens.size() == 2)
         {
             uint64_t order_id = std::stoull(tokens[1]);
-            engine_.cancelOrder(order_id);
+            engine_.submitCancel(order_id);
             std::string ack = "ACK CAN\n";
             send(client_fd, ack.c_str(), ack.size(), 0);
         }
@@ -208,7 +217,7 @@ void TCPServer::parseAndRouteCommand(int client_fd, const std::string &command)
             uint64_t order_id = std::stoull(tokens[1]);
             uint64_t new_price = std::stoull(tokens[2]);
             uint32_t new_qty = std::stoul(tokens[3]);
-            engine_.modifyOrder(order_id, new_price, new_qty);
+            engine_.submitModify(order_id, new_price, new_qty);
             std::string ack = "ACK MOD\n";
             send(client_fd, ack.c_str(), ack.size(), 0);
         }
