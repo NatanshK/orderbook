@@ -103,7 +103,7 @@ client.py — Python client that decodes binary VIEW snapshots
 - macOS (uses `kqueue` for I/O multiplexing)
 - CMake 3.15+
 - Intel TBB (`brew install tbb`)
-- Apple Clang (ships with Xcode Command Line Tools)
+- Apple Clang 
 
 ### Build
 
