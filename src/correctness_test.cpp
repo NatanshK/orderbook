@@ -1,45 +1,14 @@
-// =============================================================================
-// correctness_test.cpp  —  Deterministic Correctness Suite
-// =============================================================================
-//
-// SYNCHRONIZATION STRATEGY
-// -------------------------
-// The existing sleep(50ms) is non-deterministic. This suite instead drives
-// processQueue() manually by using a no-worker constructor so the test thread
-// has exclusive, synchronous control of the book.
-//
-// Required one-line change in OrderBook.hpp — add a second constructor:
-//
-//   // In the public section of OrderBook:
-//   explicit OrderBook(bool start_worker);   // false = test mode, no thread
-//
-// And in OrderBook.cpp:
-//
-//   OrderBook::OrderBook(bool start_worker) : is_running_(start_worker) {
-//       if (start_worker)
-//           worker_thread_ = std::thread(&OrderBook::workerLoop, this);
-//   }
-//
-// With that, every test below calls flush() after each batch, which drains the
-// queue on the calling thread with no races. cancelOrder() is already direct
-// (not queued), so no flush is needed after cancels.
-// =============================================================================
-
 #include "../include/OrderBook.hpp"
 #include <iostream>
 #include <cassert>
 #include <string>
 #include <sstream>
 
-// ---- Helpers ----------------------------------------------------------------
-
-// Drain the queue synchronously (test mode only — no worker thread running).
 static void flush(OrderBook &ob)
 {
     ob.processQueue();
 }
 
-// Nicer assert: prints actual vs. expected on failure.
 #define EXPECT_EQ(label, actual, expected)                                 \
     do                                                                     \
     {                                                                      \
@@ -63,7 +32,6 @@ static void flush(OrderBook &ob)
         }                                                        \
     } while (0)
 
-// Build a limit order tersely.
 static Order makeOrder(uint64_t id, Side side, uint64_t price, uint32_t qty)
 {
     Order o{};
@@ -80,13 +48,7 @@ static void pass(const std::string &name)
     std::cout << "[PASS] " << name << "\n";
 }
 
-// =============================================================================
-// TEST CASES
-// =============================================================================
-
-// -----------------------------------------------------------------------------
 // T01  Resting orders: buy below ask, sell above bid should NOT match
-// -----------------------------------------------------------------------------
 static void test_resting_no_match()
 {
     OrderBook ob(false); // no worker thread
@@ -106,9 +68,7 @@ static void test_resting_no_match()
     pass("T01 Resting orders do not match");
 }
 
-// -----------------------------------------------------------------------------
 // T02  Exact full fill: both sides completely consumed, book is empty
-// -----------------------------------------------------------------------------
 static void test_exact_full_fill()
 {
     OrderBook ob(false);
@@ -124,9 +84,7 @@ static void test_exact_full_fill()
     pass("T02 Exact full fill clears both sides");
 }
 
-// -----------------------------------------------------------------------------
 // T03  Partial fill: resting ask partially consumed, remainder stays
-// -----------------------------------------------------------------------------
 static void test_partial_fill()
 {
     OrderBook ob(false);
@@ -143,10 +101,8 @@ static void test_partial_fill()
     pass("T03 Partial fill leaves correct remainder");
 }
 
-// -----------------------------------------------------------------------------
 // T04  FIFO (price-time priority): two orders at the same price level
 //      The first-added must be filled before the second-added.
-// -----------------------------------------------------------------------------
 static void test_fifo_priority()
 {
     OrderBook ob(false);
@@ -180,9 +136,7 @@ static void test_fifo_priority()
     pass("T04 FIFO price-time priority");
 }
 
-// -----------------------------------------------------------------------------
 // T05  Multi-level sweep: one aggressive order crosses multiple price levels
-// -----------------------------------------------------------------------------
 static void test_multilevel_sweep()
 {
     OrderBook ob(false);
@@ -205,9 +159,7 @@ static void test_multilevel_sweep()
     pass("T05 Multi-level sweep");
 }
 
-// -----------------------------------------------------------------------------
 // T06  Cancel: order removed from book, level disappears when empty
-// -----------------------------------------------------------------------------
 static void test_cancel()
 {
     OrderBook ob(false);
@@ -229,9 +181,7 @@ static void test_cancel()
     pass("T06 Cancel removes order and cleans up empty level");
 }
 
-// -----------------------------------------------------------------------------
 // T07  Cancel non-existent order: should be a silent no-op, not a crash
-// -----------------------------------------------------------------------------
 static void test_cancel_nonexistent()
 {
     OrderBook ob(false);
@@ -248,9 +198,7 @@ static void test_cancel_nonexistent()
     pass("T07 Cancel of non-existent order is a no-op");
 }
 
-// -----------------------------------------------------------------------------
 // T08  Cancel already-filled order: should be a no-op
-// -----------------------------------------------------------------------------
 static void test_cancel_already_filled()
 {
     OrderBook ob(false);
@@ -270,9 +218,7 @@ static void test_cancel_already_filled()
     pass("T08 Cancel of already-filled order is a no-op");
 }
 
-// -----------------------------------------------------------------------------
 // T09  Modify — quantity decrease: order keeps queue position (in-place)
-// -----------------------------------------------------------------------------
 static void test_modify_qty_decrease()
 {
     OrderBook ob(false);
@@ -297,9 +243,7 @@ static void test_modify_qty_decrease()
     pass("T09 Modify qty decrease keeps queue position");
 }
 
-// -----------------------------------------------------------------------------
 // T10  Modify — price change: order loses queue position (cancel + re-add)
-// -----------------------------------------------------------------------------
 static void test_modify_price_change()
 {
     OrderBook ob(false);
@@ -322,9 +266,7 @@ static void test_modify_price_change()
     pass("T10 Modify price change relocates order");
 }
 
-// -----------------------------------------------------------------------------
 // T11  Modify quantity to zero: treated as a cancel
-// -----------------------------------------------------------------------------
 static void test_modify_qty_to_zero()
 {
     OrderBook ob(false);
@@ -341,9 +283,7 @@ static void test_modify_qty_to_zero()
     pass("T11 Modify qty=0 treated as cancel");
 }
 
-// -----------------------------------------------------------------------------
 // T12  Aggregation: multiple orders at the same price level aggregate correctly
-// -----------------------------------------------------------------------------
 static void test_aggregation()
 {
     OrderBook ob(false);
@@ -360,9 +300,7 @@ static void test_aggregation()
     pass("T12 Quantity aggregation within a price level");
 }
 
-// -----------------------------------------------------------------------------
 // T13  Snapshot depth limit: getSnapshot(N) returns at most N levels
-// -----------------------------------------------------------------------------
 static void test_snapshot_depth()
 {
     OrderBook ob(false);
@@ -378,9 +316,7 @@ static void test_snapshot_depth()
     pass("T13 Snapshot depth limit respected");
 }
 
-// -----------------------------------------------------------------------------
 // T14  Buy aggressive enough to cross: incoming buy matches AND rests remainder
-// -----------------------------------------------------------------------------
 static void test_partial_match_then_rest()
 {
     OrderBook ob(false);
@@ -536,15 +472,10 @@ static void test_trade_log()
     pass("T21 Trade log records correct data");
 }
 
-// =============================================================================
-// MAIN
-// =============================================================================
-
 int main()
 {
-    std::cout << "==============================================\n";
+
     std::cout << " Deterministic Correctness Suite\n";
-    std::cout << "==============================================\n";
 
     test_resting_no_match();
     test_exact_full_fill();
@@ -568,8 +499,7 @@ int main()
     test_ioc_order();
     test_trade_log();
 
-    std::cout << "==============================================\n";
+    std::cout << "\n\n";
     std::cout << " ALL TESTS PASSED\n";
-    std::cout << "==============================================\n";
     return 0;
 }
