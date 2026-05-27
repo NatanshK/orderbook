@@ -1,4 +1,4 @@
-# Limit Order Book Matching Engine (C++17)
+# Limit Order Book Matching Engine 
 
 A low-latency order book matching engine built from scratch in C++17 with a TCP network gateway. Supports LIMIT, MARKET, and IOC order types, cancel/modify operations, and real-time market data snapshots over a binary protocol.
 
