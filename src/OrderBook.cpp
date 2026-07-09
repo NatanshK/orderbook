@@ -2,6 +2,8 @@
 #include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <mutex>
+#include <mutex>
 
 // CONSTRUCTOR
 OrderBook::OrderBook() : is_running_(true)
@@ -26,6 +28,7 @@ void OrderBook::addOrder(Order order)
 {
     order.timestamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     order_queue_.push(order);
+    enqueued_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OrderBook::processQueue()
@@ -34,6 +37,9 @@ void OrderBook::processQueue()
 
     while (order_queue_.try_pop(current_order))
     {
+        current_order.timestamp =
+            std::chrono::high_resolution_clock::now().time_since_epoch().count();
+
         switch (current_order.action)
         {
         case Action::ADD:
@@ -55,6 +61,7 @@ void OrderBook::processQueue()
             modifyOrder(current_order.order_id, current_order.price, current_order.quantity);
             break;
         }
+        processed_.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -76,17 +83,14 @@ void OrderBook::matchBuyOrder(Order &order)
 
         while (!asks_.empty() && order.quantity > 0)
         {
-            // LIMIT orders only match if ask price <= bid price
-            if (order.type == Type::LIMIT && asks_.begin()->first > order.price)
+
+            if ((order.type == Type::LIMIT || order.type == Type::IOC) && asks_.begin()->first > order.price)
                 break;
 
             auto &best_price_list = asks_.begin()->second;
             Order &best_ask = best_price_list.front();
 
             uint32_t trade_qty = std::min(order.quantity, best_ask.quantity);
-
-            auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-            execution_latencies_.push_back(end_time - order.timestamp);
 
             Trade t;
             t.buy_order_id = order.order_id;
@@ -116,10 +120,10 @@ void OrderBook::matchBuyOrder(Order &order)
         bids_[order.price].push_back(order);
         auto new_order_iterator = std::prev(bids_[order.price].end());
         active_orders_.insert({order.order_id, new_order_iterator});
-
-        auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        execution_latencies_.push_back(end_time - order.timestamp);
     }
+
+    auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    execution_latencies_.push_back(end_time - order.timestamp);
 }
 
 void OrderBook::matchSellOrder(Order &order)
@@ -129,16 +133,13 @@ void OrderBook::matchSellOrder(Order &order)
 
         while (!bids_.empty() && order.quantity > 0)
         {
-            if (order.type == Type::LIMIT && bids_.begin()->first < order.price)
+            if ((order.type == Type::LIMIT || order.type == Type::IOC) && bids_.begin()->first < order.price)
                 break;
 
             auto &best_price_list = bids_.begin()->second;
             Order &best_bid = best_price_list.front();
 
             uint32_t trade_qty = std::min(order.quantity, best_bid.quantity);
-
-            auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-            execution_latencies_.push_back(end_time - order.timestamp);
 
             Trade t;
             t.buy_order_id = best_bid.order_id;
@@ -169,10 +170,10 @@ void OrderBook::matchSellOrder(Order &order)
         asks_[order.price].push_back(order);
         auto new_order_iterator = std::prev(asks_[order.price].end());
         active_orders_.insert({order.order_id, new_order_iterator});
-
-        auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        execution_latencies_.push_back(end_time - order.timestamp);
     }
+
+    auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    execution_latencies_.push_back(end_time - order.timestamp);
 }
 
 void OrderBook::cancelOrder(uint64_t order_id)
@@ -192,7 +193,6 @@ void OrderBook::cancelOrder(uint64_t order_id)
 
     active_orders_.erase(order_id);
 
-    // Acquiring an EXCLUSIVE lock for the specific side of the book and remove the node.
     if (order_side == Side::BUY)
     {
         std::unique_lock<std::shared_mutex> lock(bids_mutex_);
@@ -234,12 +234,12 @@ Quantity Increase? The trader is trying to jump the queue. We punish them by can
 Price Change? This is a fundamentally new order. We cancel the old one and re-add it to the new price level.
 
 Quantity becomes 0? This is just a cancellation in disguise.    */
+
 void OrderBook::modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_quantity)
 {
     auto start_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     tbb::concurrent_hash_map<uint64_t, std::list<Order>::iterator>::accessor a;
 
-    // Finding the order in the hash map
     if (!active_orders_.find(a, order_id))
     {
         return;
@@ -271,12 +271,8 @@ void OrderBook::modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_
         updated_order.price = new_price;
         updated_order.quantity = new_quantity;
 
-        // Executing the Cancel-Replace
         cancelOrder(order_id);
         addOrder(updated_order);
-
-        auto end_time = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        execution_latencies_.push_back(end_time - start_time);
 
         return;
     }
@@ -306,6 +302,7 @@ void OrderBook::submitCancel(uint64_t order_id)
     o.order_id = order_id;
     o.action = Action::CANCEL;
     order_queue_.push(o);
+    enqueued_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OrderBook::submitModify(uint64_t order_id, uint64_t new_price, uint32_t new_quantity)
@@ -316,6 +313,18 @@ void OrderBook::submitModify(uint64_t order_id, uint64_t new_price, uint32_t new
     o.quantity = new_quantity;
     o.action = Action::MODIFY;
     order_queue_.push(o);
+    enqueued_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OrderBook::drain()
+{
+    if (!is_running_)
+    {
+        processQueue();
+        return;
+    }
+    while (processed_.load(std::memory_order_acquire) < enqueued_.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
 }
 
 void OrderBook::printLatencyStats()

@@ -209,8 +209,6 @@ void TCPServer::parseAndRouteCommand(int client_fd, const std::string &command)
         {
             uint64_t order_id = std::stoull(tokens[1]);
             engine_.submitCancel(order_id);
-            std::string ack = "ACK CAN\n";
-            send(client_fd, ack.c_str(), ack.size(), 0);
         }
         else if (tokens[0] == "MOD" && tokens.size() == 4)
         {
@@ -218,8 +216,6 @@ void TCPServer::parseAndRouteCommand(int client_fd, const std::string &command)
             uint64_t new_price = std::stoull(tokens[2]);
             uint32_t new_qty = std::stoul(tokens[3]);
             engine_.submitModify(order_id, new_price, new_qty);
-            std::string ack = "ACK MOD\n";
-            send(client_fd, ack.c_str(), ack.size(), 0);
         }
         else if (tokens[0] == "VIEW")
         {
@@ -251,12 +247,15 @@ void TCPServer::parseAndRouteCommand(int client_fd, const std::string &command)
 
         else if (tokens[0] == "SHUTDOWN")
         {
-            std::cout << "[SYSTEM] Shutdown command received. Generating report...\n";
+            std::cout << "[SYSTEM] Shutdown command received. Draining queue...\n";
+            engine_.drain();
+            std::cout << "[SYSTEM] Queue drained. Generating report...\n";
             engine_.printLatencyStats();
-            is_running_ = false;
 
             std::string ack = "ACK SHUTDOWN\n";
             send(client_fd, ack.c_str(), ack.size(), 0);
+
+            is_running_ = false;
         }
         else
         {

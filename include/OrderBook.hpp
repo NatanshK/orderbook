@@ -52,6 +52,7 @@ public:
     void submitCancel(uint64_t order_id);
     void submitModify(uint64_t order_id, uint64_t new_price, uint32_t new_quantity);
     void processQueue();
+    void drain(); // Block until the worker has processed every queued order.
     const tbb::concurrent_vector<Trade> &getTradeLog() const { return trade_log_; }
     void printLatencyStats();
     OrderBookSnapshot getSnapshot(int depth = 5);
@@ -63,4 +64,6 @@ private:
     void modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_quantity);
     tbb::concurrent_vector<uint64_t> execution_latencies_;
     tbb::concurrent_vector<Trade> trade_log_;
+    std::atomic<uint64_t> enqueued_{0};
+    std::atomic<uint64_t> processed_{0};
 };

@@ -472,6 +472,192 @@ static void test_trade_log()
     pass("T21 Trade log records correct data");
 }
 
+// T22 IOC must respect its limit price: an IOC buy priced BELOW the best ask
+//     must NOT fill (this is the regression guard for the IOC price-check fix).
+//     Pre-fix, IOC ignored price and would have wrongly filled at 101.
+static void test_ioc_respects_limit_price()
+{
+    OrderBook ob(false);
+
+    ob.addOrder(makeOrder(1, Side::SELL, 101, 10)); // ask @ 101
+    flush(ob);
+
+    Order ioc = makeOrder(2, Side::BUY, 100, 10); // IOC buy @ 100 < 101
+    ioc.type = Type::IOC;
+    ob.addOrder(ioc);
+    flush(ob);
+
+    auto snap = ob.getSnapshot(5);
+    EXPECT_EQ("ask untouched (IOC did not cross)", snap.asks.size(), 1u);
+    EXPECT_EQ("ask qty unchanged", snap.asks[0].total_quantity, 10u);
+    EXPECT_EQ("IOC did not rest", snap.bids.size(), 0u);
+    EXPECT_EQ("no trades executed", ob.getTradeLog().size(), 0u);
+
+    pass("T22 IOC respects limit price (no fill through worse price)");
+}
+
+// T23 IOC that crosses partially: fills only levels at/through its limit,
+//     discards the rest, rests nothing.
+static void test_ioc_partial_cross_then_discard()
+{
+    OrderBook ob(false);
+
+    ob.addOrder(makeOrder(1, Side::SELL, 100, 10)); // fillable
+    ob.addOrder(makeOrder(2, Side::SELL, 101, 10)); // beyond IOC limit
+    flush(ob);
+
+    size_t trades_before = ob.getTradeLog().size();
+
+    Order ioc = makeOrder(3, Side::BUY, 100, 25); // limit 100: takes the 10@100 only
+    ioc.type = Type::IOC;
+    ob.addOrder(ioc);
+    flush(ob);
+
+    auto snap = ob.getSnapshot(5);
+    EXPECT_EQ("101 ask survives (beyond IOC limit)", snap.asks.size(), 1u);
+    EXPECT_EQ("surviving ask price", snap.asks[0].price, 101u);
+    EXPECT_EQ("surviving ask qty", snap.asks[0].total_quantity, 10u);
+    EXPECT_EQ("IOC remainder discarded, not rested", snap.bids.size(), 0u);
+    EXPECT_EQ("exactly one fill happened", ob.getTradeLog().size() - trades_before, 1u);
+
+    pass("T23 IOC partial cross fills only within limit, discards rest");
+}
+
+// T24 Multi-level sweep executes each fill at the RESTING order's price,
+//     not the aggressor's price. Checks the trade log prices, not just qty.
+static void test_sweep_trade_prices()
+{
+    OrderBook ob(false);
+
+    // Resting asks at 100, 101, 102.
+    ob.addOrder(makeOrder(1, Side::SELL, 100, 10));
+    ob.addOrder(makeOrder(2, Side::SELL, 101, 10));
+    ob.addOrder(makeOrder(3, Side::SELL, 102, 10));
+    flush(ob);
+
+    size_t base = ob.getTradeLog().size();
+
+    // Aggressive buy at 102 sweeps all three levels.
+    ob.addOrder(makeOrder(4, Side::BUY, 102, 30));
+    flush(ob);
+
+    auto &trades = ob.getTradeLog();
+    EXPECT_EQ("three fills recorded", trades.size() - base, 3u);
+    // Fills happen best-price-first: 100, then 101, then 102.
+    EXPECT_EQ("fill 1 at resting price 100", trades[base + 0].price, 100u);
+    EXPECT_EQ("fill 2 at resting price 101", trades[base + 1].price, 101u);
+    EXPECT_EQ("fill 3 at resting price 102", trades[base + 2].price, 102u);
+    // Aggressor is the buyer in every fill.
+    EXPECT_EQ("fill 1 buyer is aggressor", trades[base + 0].buy_order_id, 4u);
+    EXPECT_EQ("fill 3 buyer is aggressor", trades[base + 2].buy_order_id, 4u);
+
+    pass("T24 Sweep fills at resting prices, ascending");
+}
+
+// T25 Conservation: total quantity bought == total quantity sold across the log,
+//     and filled + resting == submitted for a controlled scenario.
+static void test_quantity_conservation()
+{
+    OrderBook ob(false);
+
+    // Submit 100 total on each side in a crossing arrangement.
+    ob.addOrder(makeOrder(1, Side::SELL, 100, 60));
+    ob.addOrder(makeOrder(2, Side::SELL, 100, 40)); // 100 sell submitted
+    flush(ob);
+    ob.addOrder(makeOrder(3, Side::BUY, 100, 70)); // 70 buy crosses
+    flush(ob);
+
+    auto &trades = ob.getTradeLog();
+    uint64_t total_traded = 0;
+    for (auto const &t : trades)
+        total_traded += t.quantity;
+
+    // 70 should have traded (buy side fully filled against 100 available).
+    EXPECT_EQ("total traded quantity", total_traded, 70u);
+
+    // Remaining on ask side should be 100 - 70 = 30.
+    auto snap = ob.getSnapshot(5);
+    uint64_t resting_ask = 0;
+    for (auto const &l : snap.asks)
+        resting_ask += l.total_quantity;
+    EXPECT_EQ("resting ask after partial cross", resting_ask, 30u);
+    EXPECT_EQ("no resting bids", snap.bids.size(), 0u);
+
+    // Conservation: submitted sell (100) == traded (70) + resting ask (30).
+    EXPECT_EQ("sell-side conservation", total_traded + resting_ask, 100u);
+
+    pass("T25 Quantity conservation (traded + resting == submitted)");
+}
+
+// T26 MARKET order larger than available liquidity: fills everything, discards
+//     the unfillable remainder, rests nothing.
+static void test_market_exceeds_liquidity()
+{
+    OrderBook ob(false);
+
+    ob.addOrder(makeOrder(1, Side::SELL, 100, 10));
+    ob.addOrder(makeOrder(2, Side::SELL, 101, 10)); // 20 total available
+    flush(ob);
+
+    size_t base = ob.getTradeLog().size();
+
+    Order market = makeOrder(3, Side::BUY, 0, 50); // wants 50, only 20 exist
+    market.type = Type::MARKET;
+    ob.addOrder(market);
+    flush(ob);
+
+    auto snap = ob.getSnapshot(5);
+    EXPECT_EQ("all asks consumed", snap.asks.size(), 0u);
+    EXPECT_EQ("market did not rest the remainder", snap.bids.size(), 0u);
+    EXPECT_EQ("two fills for the 20 available", ob.getTradeLog().size() - base, 2u);
+
+    pass("T26 MARKET over-liquidity fills available, discards rest");
+}
+
+// T27 MARKET order against an empty book: clean no-op, no crash, no rest.
+static void test_market_empty_book()
+{
+    OrderBook ob(false);
+
+    Order market = makeOrder(1, Side::BUY, 0, 10);
+    market.type = Type::MARKET;
+    ob.addOrder(market);
+    flush(ob);
+
+    auto snap = ob.getSnapshot(5);
+    EXPECT_EQ("no bids after market on empty book", snap.bids.size(), 0u);
+    EXPECT_EQ("no asks", snap.asks.size(), 0u);
+    EXPECT_EQ("no trades", ob.getTradeLog().size(), 0u);
+
+    pass("T27 MARKET on empty book is a no-op");
+}
+
+// T28 Sell-side sweep trade prices: aggressive sell fills at resting bid prices,
+//     highest bid first (descending).
+static void test_sell_sweep_trade_prices()
+{
+    OrderBook ob(false);
+
+    ob.addOrder(makeOrder(1, Side::BUY, 102, 10));
+    ob.addOrder(makeOrder(2, Side::BUY, 101, 10));
+    ob.addOrder(makeOrder(3, Side::BUY, 100, 10));
+    flush(ob);
+
+    size_t base = ob.getTradeLog().size();
+
+    ob.addOrder(makeOrder(4, Side::SELL, 100, 30)); // sweep down to 100
+    flush(ob);
+
+    auto &trades = ob.getTradeLog();
+    EXPECT_EQ("three fills", trades.size() - base, 3u);
+    EXPECT_EQ("fill 1 at best bid 102", trades[base + 0].price, 102u);
+    EXPECT_EQ("fill 2 at 101", trades[base + 1].price, 101u);
+    EXPECT_EQ("fill 3 at 100", trades[base + 2].price, 100u);
+    EXPECT_EQ("seller is aggressor", trades[base + 0].sell_order_id, 4u);
+
+    pass("T28 Sell sweep fills at resting bid prices, descending");
+}
+
 int main()
 {
 
@@ -498,6 +684,13 @@ int main()
     test_market_order();
     test_ioc_order();
     test_trade_log();
+    test_ioc_respects_limit_price();
+    test_ioc_partial_cross_then_discard();
+    test_sweep_trade_prices();
+    test_quantity_conservation();
+    test_market_exceeds_liquidity();
+    test_market_empty_book();
+    test_sell_sweep_trade_prices();
 
     std::cout << "\n\n";
     std::cout << " ALL TESTS PASSED\n";
