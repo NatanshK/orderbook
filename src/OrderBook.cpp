@@ -247,6 +247,7 @@ void OrderBook::modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_
 
     std::list<Order>::iterator order_location = a->second;
     Side order_side = order_location->side;
+    Type order_type = order_location->type;
     uint64_t old_price = order_location->price;
     uint32_t old_quantity = order_location->quantity;
 
@@ -265,9 +266,10 @@ void OrderBook::modifyOrder(uint64_t order_id, uint64_t new_price, uint32_t new_
     {
 
         // Constructing the replacement order
-        Order updated_order;
+        Order updated_order{};
         updated_order.order_id = order_id;
         updated_order.side = order_side;
+        updated_order.type = order_type;
         updated_order.price = new_price;
         updated_order.quantity = new_quantity;
 
